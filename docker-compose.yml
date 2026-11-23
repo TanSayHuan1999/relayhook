@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: relayhook
+      POSTGRES_PASSWORD: relayhook
+      POSTGRES_DB: relayhook
+    ports:
+      - "5432:5432"
+    volumes:
+      - relayhook-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relayhook -d relayhook"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://relayhook:relayhook@db:5432/relayhook
+      PORT: "8080"
+      RELAYHOOK_SIGNING_SECRET: ${RELAYHOOK_SIGNING_SECRET:-dev-secret-change-me}
+      RELAYHOOK_MAX_ATTEMPTS: "5"
+      RELAYHOOK_BACKOFF_BASE_SECONDS: "2"
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  relayhook-db:
