@@ -80,3 +80,72 @@ Each delivery attempt is a POST of the original payload with:
 - `X-Relayhook-Attempt` — the attempt number
 - `X-Relayhook-Signature` — `sha256=<hex HMAC-SHA256 of the payload>`,
   keyed with the server's signing secret, so receivers can verify the
+  webhook really came from relayhook
+
+Any 2xx response counts as delivered. Anything else is retried with
+exponential backoff plus jitter, up to the max attempts, then the
+delivery is marked `dead` and kept for inspection — never silently
+dropped.
+
+## Design decisions worth talking about
+
+- **Postgres as the queue.** `FOR UPDATE SKIP LOCKED` lets multiple
+  workers claim rows without stepping on each other, and the delivery
+  state lives in the same transaction as the attempt record. A broker
+  would add a second system to run before it adds any value.
+- **Idempotency at insert.** A unique constraint on the idempotency key
+  plus `ON CONFLICT DO NOTHING` makes duplicate submissions a database
+  guarantee, not application hope.
+- **Stuck-delivery recovery.** Rows left in `delivering` by a crashed
+  worker are reclaimed after 30 seconds, so a crash mid-delivery delays
+  an event instead of losing it.
+- **One transaction per attempt outcome.** The attempt row and the
+  delivery’s state transition commit together — the history can never
+  disagree with the status.
+
+One honest nuance: payloads are stored as `jsonb`, and Postgres
+re-serialises jsonb (key order and spacing can change). The worker signs
+the stored bytes — exactly the bytes it sends — so receiver-side
+verification still holds. Byte-exact passthrough would store a `bytea`
+copy alongside; it is noted as future work rather than hidden.
+
+## Run it
+
+With Docker:
+
+```bash
+cp .env.example .env
+docker compose up
+```
+
+Locally (needs Go and a Postgres to point at):
+
+```bash
+DATABASE_URL=postgres://relayhook:relayhook@localhost:5432/relayhook go run ./cmd/relayhook
+```
+
+The schema is created automatically at startup. Configuration is
+environment-only: `DATABASE_URL` (required), `PORT` (8080),
+`RELAYHOOK_SIGNING_SECRET`, `RELAYHOOK_MAX_ATTEMPTS` (5),
+`RELAYHOOK_BACKOFF_BASE_SECONDS` (2).
+
+## Tests
+
+```bash
+DATABASE_URL=postgres://relayhook:relayhook@localhost:5432/relayhook go test ./...
+```
+
+Unit tests cover the backoff schedule and HMAC signing (known-answer
+vector). Integration tests run the real worker against a throwaway
+database per test package: a receiver that fails twice then succeeds
+ends `delivered` with 3 recorded attempts; an always-failing receiver
+ends `dead`; a duplicate idempotency key produces exactly one delivery.
+
+Verified end to end against a live server: retry-then-succeed delivered
+on attempt 3 with backoff-spaced attempt timestamps, duplicate
+submission returned the same delivery id with no extra receiver request,
+and an always-500 receiver exhausted its attempts into the dead state.
+
+## License
+
+MIT
